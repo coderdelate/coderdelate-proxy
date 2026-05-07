@@ -2,16 +2,15 @@
 'use strict';
 
 /**
- * Minimal forward HTTP/HTTPS proxy with optional Basic auth.
+ * Improved forward HTTP/HTTPS proxy with optional Basic auth, timeouts, and safer header handling.
  *
- * Usage:
- *  PORT=8000 node index.js
- *  AUTH_REQUIRED=1 PROXY_USER=alice PROXY_PASS=secret PORT=8000 node index.js
- *
- * No external dependencies.
+ * Run:
+ *   PORT=8000 node index.js
+ *   AUTH_REQUIRED=1 PROXY_USER=alice PROXY_PASS=secret PORT=8000 node index.js
  */
 
 const http = require('http');
+const https = require('https');
 const net = require('net');
 const { URL } = require('url');
 
@@ -19,13 +18,13 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8000;
 const AUTH_REQUIRED = !!process.env.AUTH_REQUIRED;
 const PROXY_USER = process.env.PROXY_USER || '';
 const PROXY_PASS = process.env.PROXY_PASS || '';
-const LOG = (msg, ...args) => {
-  console.log(new Date().toISOString(), msg, ...args);
-};
+const REQUEST_TIMEOUT_MS = 120000; // 2 minutes
+
+const LOG = (...args) => console.log(new Date().toISOString(), ...args);
 
 function parseBasicAuth(header) {
-  if (!header) return null;
-  const m = header.match(/Basic\s+(.+)/i);
+  if (!header || typeof header !== 'string') return null;
+  const m = header.match(/^Basic\s+(.+)$/i);
   if (!m) return null;
   try {
     const decoded = Buffer.from(m[1], 'base64').toString('utf8');
@@ -37,43 +36,81 @@ function parseBasicAuth(header) {
   }
 }
 
-function checkAuth(header) {
+function isAuthorized(header) {
   if (!AUTH_REQUIRED) return true;
   const creds = parseBasicAuth(header);
   if (!creds) return false;
   return creds.user === PROXY_USER && creds.pass === PROXY_PASS;
 }
 
+const HOP_BY_HOP = [
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailers',
+  'transfer-encoding',
+  'upgrade'
+];
+
+function stripHopByHopHeaders(headers) {
+  for (const h of HOP_BY_HOP) delete headers[h];
+  // Also remove headers listed in Connection header
+  if (headers.connection) {
+    const parts = headers.connection.split(',');
+    for (const p of parts) {
+      const k = p && p.trim().toLowerCase();
+      if (k) delete headers[k];
+    }
+    delete headers.connection;
+  }
+}
+
 const server = http.createServer();
 
-// Handle regular HTTP requests (GET, POST, etc. using full URL from client)
 server.on('request', (clientReq, clientRes) => {
-  const proxyAuthHeader = clientReq.headers['proxy-authorization'] || clientReq.headers['proxy-authenticate'];
-  if (!checkAuth(proxyAuthHeader)) {
+  const start = Date.now();
+  const remote = clientReq.socket && clientReq.socket.remoteAddress;
+  const proxyAuth = clientReq.headers['proxy-authorization'];
+
+  if (!isAuthorized(proxyAuth)) {
     clientRes.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Proxy"' });
     clientRes.end('Proxy authentication required');
-    LOG('407 Proxy auth required', clientReq.method, clientReq.url, clientReq.socket.remoteAddress);
+    LOG('407', clientReq.method, clientReq.url, 'from', remote || '-', 'auth failed');
     return;
   }
 
-  // clientReq.url may be absolute-form (when talking to an HTTP proxy)
+  // parse target URL: clientReq.url should be absolute-form for proxies, but be defensive
   let targetUrl;
   try {
     targetUrl = new URL(clientReq.url);
-  } catch (e) {
-    // fallback: build URL from Host header
-    const host = clientReq.headers['host'];
-    if (!host) {
+  } catch (err) {
+    const hostHeader = clientReq.headers['host'];
+    if (!hostHeader) {
       clientRes.writeHead(400);
       clientRes.end('Bad request: no host');
+      LOG('400 missing host', clientReq.method, clientReq.url, 'from', remote || '-');
       return;
     }
     const scheme = clientReq.socket.encrypted ? 'https:' : 'http:';
-    targetUrl = new URL(`${scheme}//${host}${clientReq.url}`);
+    try {
+      targetUrl = new URL(`${scheme}//${hostHeader}${clientReq.url}`);
+    } catch (err2) {
+      clientRes.writeHead(400);
+      clientRes.end('Bad request');
+      LOG('400 url parse failed', clientReq.method, clientReq.url, 'from', remote || '-');
+      return;
+    }
   }
 
   const isTls = targetUrl.protocol === 'https:';
-  const port = targetUrl.port || (isTls ? 443 : 80);
+  const port = targetUrl.port ? parseInt(targetUrl.port, 10) : (isTls ? 443 : 80);
+
+  const headers = Object.assign({}, clientReq.headers);
+  stripHopByHopHeaders(headers);
+  // ensure we don't forward proxy-specific headers
+  delete headers['proxy-authorization'];
 
   const options = {
     protocol: targetUrl.protocol,
@@ -81,77 +118,123 @@ server.on('request', (clientReq, clientRes) => {
     port: port,
     method: clientReq.method,
     path: targetUrl.pathname + targetUrl.search,
-    headers: Object.assign({}, clientReq.headers),
+    headers,
+    agent: false
   };
 
-  // Remove hop-by-hop headers that should not be forwarded
-  delete options.headers['proxy-authorization'];
-  delete options.headers['proxy-authenticate'];
-  delete options.headers['proxy-connection'];
-  options.headers['connection'] = 'close';
-
-  const proxyReq = (isTls ? require('https') : require('http')).request(options, (proxyRes) => {
-    // Copy status and headers
-    clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+  const proxyModule = isTls ? https : http;
+  const proxyReq = proxyModule.request(options, (proxyRes) => {
+    clientRes.writeHead(proxyRes.statusCode, proxyRes.statusMessage, proxyRes.headers);
     proxyRes.pipe(clientRes, { end: true });
+
+    proxyRes.on('end', () => {
+      const took = Date.now() - start;
+      LOG('HTTP', clientReq.method, targetUrl.href, '->', proxyRes.statusCode, `${took}ms`, 'from', remote || '-');
+    });
   });
 
+  proxyReq.on('timeout', () => {
+    proxyReq.abort();
+  });
+
+  proxyReq.setTimeout(REQUEST_TIMEOUT_MS);
+
   proxyReq.on('error', (err) => {
-    LOG('HTTP proxy request error', err && err.message);
     if (!clientRes.headersSent) {
       clientRes.writeHead(502);
       clientRes.end('Bad gateway: ' + (err && err.message));
     } else {
       clientRes.end();
     }
+    LOG('HTTP proxy request error', err && err.message, 'for', clientReq.url, 'from', remote || '-');
   });
 
-  // Pipe request body
-  clientReq.pipe(proxyReq, { end: true });
+  clientReq.on('error', (err) => {
+    LOG('Client request error', err && err.message, 'from', remote || '-');
+    proxyReq.abort();
+  });
 
-  LOG('HTTP proxy', clientReq.method, targetUrl.href, 'from', clientReq.socket.remoteAddress);
+  // timeouts on client socket
+  if (clientReq.socket && typeof clientReq.socket.setTimeout === 'function') {
+    clientReq.socket.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      clientReq.destroy();
+    });
+  }
+
+  clientReq.pipe(proxyReq, { end: true });
 });
 
-// Handle HTTPS CONNECT method for tunneling
 server.on('connect', (req, clientSocket, head) => {
-  // req.url is in the form "hostname:port"
-  const proxyAuthHeader = req.headers['proxy-authorization'];
-  if (!checkAuth(proxyAuthHeader)) {
-    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
-    clientSocket.destroy();
-    LOG('CONNECT 407 Proxy auth required', req.url, clientSocket.remoteAddress);
+  // CONNECT request for HTTPS tunneling. req.url is host:port
+  const remote = clientSocket && clientSocket.remoteAddress;
+  const proxyAuth = req.headers['proxy-authorization'];
+
+  if (!isAuthorized(proxyAuth)) {
+    // respond with 407 over the raw socket
+    clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n');
+    clientSocket.write('Proxy-Authenticate: Basic realm="Proxy"\r\n');
+    clientSocket.write('\r\n');
+    clientSocket.end();
+    LOG('CONNECT 407', req.url, 'from', remote || '-', 'auth failed');
     return;
   }
 
-  const [host, portStr] = req.url.split(':');
-  const port = parseInt(portStr, 10) || 443;
+  const [hostPart, portPart] = req.url.split(':');
+  const host = hostPart;
+  const port = parseInt(portPart, 10) || 443;
 
-  const serverSocket = net.connect(port, host, () => {
-    // Write HTTP/1.1 200 Connection Established and pipe
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    // If any buffered data exists, pipe it
+  let serverSocket;
+  let connected = false;
+
+  serverSocket = net.connect({ host, port }, () => {
+    connected = true;
+    // inform client the tunnel is established
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n' +
+      'Proxy-agent: coderdelate-proxy\r\n' +
+      '\r\n');
+    // if there is buffered data, send it
     if (head && head.length) serverSocket.write(head);
+    // pipe bidirectionally
     serverSocket.pipe(clientSocket);
     clientSocket.pipe(serverSocket);
+    LOG('CONNECT', req.url, 'established', 'from', remote || '-');
   });
 
-  serverSocket.on('error', (err) => {
-    LOG('CONNECT tunnel error', err && err.message);
-    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+  // set timeouts
+  clientSocket.setTimeout(REQUEST_TIMEOUT_MS, () => {
+    LOG('Client socket timeout', req.url, 'from', remote || '-');
+    clientSocket.destroy();
+    if (serverSocket) serverSocket.destroy();
+  });
+
+  serverSocket.setTimeout(REQUEST_TIMEOUT_MS, () => {
+    LOG('Upstream socket timeout', req.url, 'to', host + ':' + port);
+    serverSocket.destroy();
     clientSocket.destroy();
   });
 
-  clientSocket.on('error', (err) => {
-    LOG('Client socket error during CONNECT', err && err.message);
-    serverSocket.destroy();
+  serverSocket.on('error', (err) => {
+    if (!connected) {
+      // failed to connect
+      try {
+        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      } catch (e) {}
+      clientSocket.end();
+    } else {
+      clientSocket.destroy();
+    }
+    LOG('CONNECT tunnel error', err && err.message, 'to', req.url);
   });
 
-  LOG('CONNECT', req.url, 'from', clientSocket.remoteAddress);
+  clientSocket.on('error', (err) => {
+    LOG('Client socket error during CONNECT', err && err.message, 'from', remote || '-');
+    if (serverSocket) serverSocket.destroy();
+  });
 });
 
 server.on('clientError', (err, socket) => {
   LOG('Client error', err && err.message);
-  socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+  try { socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); } catch (e) {}
 });
 
 server.listen(PORT, () => {
